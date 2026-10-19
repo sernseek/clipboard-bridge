@@ -1,0 +1,18 @@
+[package]
+name = "clipboard-bridge"
+version = "0.2.0"
+edition = "2024"
+description = "Native Wayland and X11 clipboard bridge"
+publish = false
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+signal-hook = "0.3"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+x11rb = { version = "0.13", features = ["xfixes"] }
+
+[[bin]]
+name = "clipboard-bridge"
+path = "src/main.rs"
