@@ -14,18 +14,24 @@ pub const FILE_LIMIT: usize = 4 * 1024 * 1024;
 pub enum Side {
     Wayland,
     X11,
+    /// A passthrough guest (`guest`): no backend of its own, its copies
+    /// arrive whole and are published on both displays.
+    Guest,
 }
 impl Side {
     pub const fn index(self) -> usize {
         match self {
             Self::Wayland => 0,
             Self::X11 => 1,
+            Self::Guest => 2,
         }
     }
+    /// The other display.
     pub const fn other(self) -> Self {
         match self {
             Self::Wayland => Self::X11,
             Self::X11 => Self::Wayland,
+            Self::Guest => panic!("the guest is not a display"),
         }
     }
 }
@@ -33,7 +39,7 @@ impl Side {
 #[derive(Default)]
 pub struct Shared {
     pub epoch: AtomicU64,
-    pub serials: [AtomicU64; 2],
+    pub serials: [AtomicU64; 3],
 }
 impl Shared {
     pub fn selection(&self, side: Side, serial: u64, types: &[String]) -> u64 {
@@ -116,6 +122,10 @@ pub enum Event {
         side: Side,
         error: String,
     },
+    /// Where kvm-switch's router sends the input; None while it is not running.
+    Switch(Option<crate::guest::Target>),
+    /// A copy in the guest, already read and converted.
+    GuestOffer(Payload),
     Shutdown,
 }
 

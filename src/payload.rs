@@ -4,6 +4,14 @@ use std::sync::{Arc, LazyLock};
 pub const GNOME: &str = "x-special/gnome-copied-files";
 pub const URI: &str = "text/uri-list";
 pub const KDE: &str = "application/x-kde-cutselection";
+/// Text types in order of preference.
+pub const TEXT: [&str; 5] = [
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "TEXT",
+    "STRING",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -40,20 +48,13 @@ impl Format {
                 cut: false,
             });
         }
-        [
-            "text/plain;charset=utf-8",
-            "text/plain",
-            "UTF8_STRING",
-            "TEXT",
-            "STRING",
-        ]
-        .into_iter()
-        .find(|mime| types.iter().any(|t| t == mime))
-        .map(|mime| Self {
-            kind: Kind::Text,
-            mime: mime.to_owned(),
-            cut: false,
-        })
+        TEXT.into_iter()
+            .find(|mime| types.iter().any(|t| t == mime))
+            .map(|mime| Self {
+                kind: Kind::Text,
+                mime: mime.to_owned(),
+                cut: false,
+            })
     }
     pub fn requests(&self) -> Vec<ReadItem> {
         let limit = match self.kind {
@@ -94,29 +95,9 @@ impl Format {
             Kind::Image if primary.len() <= IMAGE_LIMIT => Some(Payload {
                 formats: vec![(self.mime.clone(), primary)],
             }),
-            Kind::Text if primary.len() <= TEXT_LIMIT => {
-                let text = std::str::from_utf8(&primary).ok()?;
-                let latin1 = if text.is_ascii() {
-                    Some(Arc::clone(&primary))
-                } else if text.chars().all(|c| u32::from(c) <= 255) {
-                    Some(Arc::new(text.chars().map(|c| c as u8).collect::<Vec<_>>()))
-                } else {
-                    None
-                };
-                let mut formats = Vec::with_capacity(5);
-                for mime in [
-                    "text/plain;charset=utf-8",
-                    "text/plain",
-                    "UTF8_STRING",
-                    "TEXT",
-                ] {
-                    formats.push((mime.to_owned(), Arc::clone(&primary)));
-                }
-                if let Some(bytes) = latin1 {
-                    formats.push(("STRING".to_owned(), bytes));
-                }
-                Some(Payload { formats })
-            }
+            Kind::Text if primary.len() <= TEXT_LIMIT => Some(Payload {
+                formats: text_formats(primary)?,
+            }),
             Kind::Files if primary.len() <= FILE_LIMIT => files(
                 &self.mime,
                 primary,
@@ -125,6 +106,31 @@ impl Format {
             _ => None,
         }
     }
+}
+
+/// UTF-8 text under every text type, plus Latin-1 `STRING` when it fits.
+pub fn text_formats(primary: Arc<Vec<u8>>) -> Option<Vec<(String, Arc<Vec<u8>>)>> {
+    let text = std::str::from_utf8(&primary).ok()?;
+    let latin1 = if text.is_ascii() {
+        Some(Arc::clone(&primary))
+    } else if text.chars().all(|c| u32::from(c) <= 255) {
+        Some(Arc::new(text.chars().map(|c| c as u8).collect::<Vec<_>>()))
+    } else {
+        None
+    };
+    let mut formats = Vec::with_capacity(5);
+    for mime in [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "TEXT",
+    ] {
+        formats.push((mime.to_owned(), Arc::clone(&primary)));
+    }
+    if let Some(bytes) = latin1 {
+        formats.push(("STRING".to_owned(), bytes));
+    }
+    Some(formats)
 }
 
 fn valid_uri(uri: &str) -> bool {
@@ -156,7 +162,8 @@ fn valid_uri(uri: &str) -> bool {
     }
     true
 }
-fn files(mime: &str, primary: Arc<Vec<u8>>, flag: Option<&[u8]>) -> Option<Payload> {
+/// A file list in every file type; `flag` is the KDE cut flag, if offered.
+pub fn files(mime: &str, primary: Arc<Vec<u8>>, flag: Option<&[u8]>) -> Option<Payload> {
     let flag = match flag {
         None => None,
         Some(b"0") => Some(false),

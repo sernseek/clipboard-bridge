@@ -2,7 +2,9 @@
 
 A compatibility daemon for clipboard transfers between Wayland and X11/XWayland
 on Linux. A single Rust process monitors both protocols and applies explicit
-format-selection and file-list normalization policies.
+format-selection and file-list normalization policies. Optionally, a Windows
+guest with a passed-through display joins as a third clipboard, synchronized
+whenever the keyboard and mouse change sides (see [Passthrough guest](#passthrough-guest)).
 
 ## How this differs from clipboard tools
 
@@ -66,6 +68,38 @@ Reads and individual outgoing transfers have a 5-second deadline. Limits are
 the latter is not a limit on the size of the referenced files. Transfer buffers
 are shared between threads and concurrent readers, not copied once per consumer.
 
+## Passthrough guest
+
+`--guest-port PORT [--guest-cid CID] [--switch-socket PATH]` adds a Windows
+guest whose screen is a separate monitor and whose keyboard and mouse are
+shared by the router of kvm-switch (a separate project).
+The bridge follows the router's `target host|guest` lines on its control
+socket (default `/run/kvm-switch/control.sock`):
+
+- Entering the guest sends the latest genuine host copy, unless the guest
+  already holds that generation (it came from the guest, or was sent before).
+- Leaving it fetches the guest's clipboard if something was copied there
+  meanwhile, and publishes it on both Wayland and X11 as a new copy.
+
+Formats: UTF-8 text, HTML (Windows' "HTML Format" with its offset header,
+converted both ways; UTF-16 or BOM-prefixed `text/html` is decoded), PNG
+(Windows also gets a bitmap and bitmap-only copies are converted), and copied
+files and folders. Files travel **with their contents**, up to 512 MiB per
+copy, and are offered from `%TEMP%\clipboard-bridge` or
+`~/.cache/clipboard-bridge` like a file manager's copy (CF_HDROP with a copy
+drop effect; `text/uri-list`, GNOME and KDE types); each new copy replaces the
+previous directory. Names Windows forbids are changed to `_` there; paths that
+could leave the directory are refused. As between the displays, copied files go
+alone and an image wins over its HTML companion. Text, HTML and PNG are
+limited to 64 MiB each.
+
+The guest agent, `guest/` (`nix build` the package's `passthru.guest`,
+cross-built with mingw), runs in the user's session, for example as a logon
+task: `clipboard-bridge-guest.exe [port]`. It needs the viosock driver for
+AF_VSOCK; only the configured CID is accepted. The messages are in
+`src/guest/wire.rs`, built by both crates. A locked Windows session cannot open
+its clipboard; the agent then reports no change.
+
 ## Requirements
 
 - A Wayland compositor exposing `zwlr_data_control_manager_v1` (version 1 or 2).
@@ -86,6 +120,9 @@ forwarded data while running; restarting it is not a persistent clipboard store.
 - `src/protocol.rs`: shared immutable buffers, commands, wake sockets and guards.
 - `src/wayland.rs`: native data-control offers/sources and nonblocking pipe I/O.
 - `src/x11.rs`: native XFixes, selection ownership, TARGETS and INCR state machines.
+- `src/guest/`: the optional passthrough guest: vsock listener, router
+  switches, messages and file packing (`wire.rs`, shared with `guest/`).
+- `guest/`: the Windows guest agent.
 
 The protocol workers block on their display/wake descriptors and transfer
 deadlines. Idle operation does not poll periodically. Display connection loss

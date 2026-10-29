@@ -1,9 +1,11 @@
+mod guest;
 mod payload;
 mod protocol;
 mod wayland;
 mod x11;
 
 use anyhow::{Context, Result};
+use guest::{Bundle, Guest, Target};
 use payload::Format;
 use protocol::{Command, Control, Event, Guard, MARKER, Payload, Shared, Side};
 use std::collections::HashMap;
@@ -25,6 +27,11 @@ enum ReadJob {
         format: Format,
         payload: Arc<Payload>,
     },
+    /// The latest copy, for the guest the input just moved to.
+    Guest {
+        guard: Guard,
+        bundle: Bundle,
+    },
 }
 struct Pending {
     side: Side,
@@ -36,14 +43,88 @@ fn coordinate(
     events: mpsc::Receiver<Event>,
     controls: &[Control; 2],
     shared: &Shared,
+    guest: Option<&Guest>,
 ) -> Result<()> {
     let mut offers: [Option<Offer>; 2] = [None, None];
     let mut ready = [false; 2];
     let mut jobs = HashMap::with_capacity(2);
     let mut next_id = 0_u64;
+    // The side and generation of the latest genuine copy, and the
+    // generation the guest holds: it gets each copy once, never its own.
+    let mut latest: Option<(Side, u64)> = None;
+    let mut guest_has: Option<u64> = None;
+    let mut target: Option<Target> = None;
     while let Ok(event) = events.recv() {
         match event {
             Event::Shutdown => return Ok(()),
+            Event::Switch(to) => {
+                let from = std::mem::replace(&mut target, to);
+                let (Some(guest), Some(from), Some(to)) = (guest, from, to) else {
+                    continue;
+                };
+                if from == to {
+                    continue;
+                }
+                if to == Target::Host {
+                    guest.fetch();
+                    continue;
+                }
+                let Some((side, epoch)) = latest else {
+                    continue;
+                };
+                if side == Side::Guest
+                    || guest_has == Some(epoch)
+                    || epoch != shared.epoch.load(Ordering::SeqCst)
+                {
+                    continue;
+                }
+                let Some(offer) = offers[side.index()].as_ref() else {
+                    continue;
+                };
+                let Some(bundle) = Bundle::select(&offer.types) else {
+                    continue;
+                };
+                next_id += 1;
+                controls[side.index()].send(Command::Read {
+                    id: next_id,
+                    serial: offer.serial,
+                    items: bundle.requests(),
+                })?;
+                let guard = Guard {
+                    epoch,
+                    source: side,
+                    serial: offer.serial,
+                };
+                jobs.insert(
+                    next_id,
+                    Pending {
+                        side,
+                        serial: offer.serial,
+                        job: ReadJob::Guest { guard, bundle },
+                    },
+                );
+            }
+            Event::GuestOffer(payload) => {
+                // A copy like any other: newer than everything pending.
+                let epoch = shared.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                let serial = shared.serials[Side::Guest.index()].fetch_add(1, Ordering::SeqCst) + 1;
+                let guard = Guard {
+                    epoch,
+                    source: Side::Guest,
+                    serial,
+                };
+                jobs.clear();
+                let payload = Arc::new(payload);
+                for control in controls {
+                    control.send(Command::CancelReads)?;
+                    control.send(Command::Publish {
+                        guard,
+                        payload: Arc::clone(&payload),
+                    })?;
+                }
+                latest = Some((Side::Guest, epoch));
+                guest_has = Some(epoch);
+            }
             Event::Failed { side, error } => anyhow::bail!("{side:?} backend: {error}"),
             Event::Ready(side) => {
                 ready[side.index()] = true;
@@ -63,6 +144,7 @@ fn coordinate(
                 if own || epoch != shared.epoch.load(Ordering::SeqCst) {
                     continue;
                 }
+                latest = Some((side, epoch));
                 jobs.clear();
                 for control in controls {
                     control.send(Command::CancelReads)?;
@@ -104,6 +186,18 @@ fn coordinate(
                     continue;
                 }
                 match pending.job {
+                    ReadJob::Guest { guard, bundle } => {
+                        if !shared.valid(guard) {
+                            continue;
+                        }
+                        let (Some(guest), Some(outgoing)) =
+                            (guest, data.and_then(|values| bundle.normalize(values)))
+                        else {
+                            continue;
+                        };
+                        guest.push(outgoing);
+                        guest_has = Some(guard.epoch);
+                    }
                     ReadJob::Source { guard, format } => {
                         if !shared.valid(guard) {
                             continue;
@@ -167,7 +261,33 @@ fn coordinate(
     anyhow::bail!("all backend event channels closed")
 }
 
+/// `--guest-port PORT [--guest-cid CID] [--switch-socket PATH]` adds a
+/// passthrough guest; without it the bridge only joins the two displays.
+fn guest_config() -> Result<Option<guest::Config>> {
+    let mut port = None;
+    let mut cid = 3;
+    let mut switch_socket = "/run/kvm-switch/control.sock".into();
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--guest-port" => port = Some(value.parse()?),
+            "--guest-cid" => cid = value.parse()?,
+            "--switch-socket" => switch_socket = value.into(),
+            _ => anyhow::bail!("unknown argument {flag}"),
+        }
+    }
+    Ok(port.map(|port| guest::Config {
+        port,
+        cid,
+        switch_socket,
+    }))
+}
+
 fn main() -> Result<()> {
+    let guest_config = guest_config()?;
     // Native writes may target a consumer which closed its pipe early.
     // EPIPE is an individual transfer failure, never a process-wide signal.
     unsafe {
@@ -212,9 +332,12 @@ fn main() -> Result<()> {
                 .with_context(|| format!("start {side:?} backend"))?,
         );
     }
+    let guest = guest_config
+        .map(|config| guest::spawn(config, events_tx.clone()))
+        .transpose()?;
     drop(events_tx);
     let controls = [wayland_control, x11_control];
-    let result = coordinate(events_rx, &controls, &shared);
+    let result = coordinate(events_rx, &controls, &shared, guest.as_ref());
     for control in &controls {
         let _ = control.send(Command::Stop);
     }
